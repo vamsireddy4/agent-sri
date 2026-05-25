@@ -198,9 +198,34 @@ def maximize_window():
         except Exception:
             pyautogui.hotkey("super", "up")
 
+def _macos_snap(left: bool):
+    """Tile the frontmost window to the left/right half of the main display.
+
+    Works on any macOS version via AppleScript (no dependency on the
+    Sequoia-only window-tiling shortcuts). Screen size is read from the
+    desktop bounds so it matches the coordinate space System Events uses."""
+    pos_x = "0" if left else "halfW"
+    script = f'''
+tell application "Finder" to set b to bounds of window of desktop
+set screenW to (item 3 of b)
+set screenH to (item 4 of b)
+set halfW to screenW / 2
+set menuBar to 24
+tell application "System Events"
+    set proc to first application process whose frontmost is true
+    if (count of windows of proc) > 0 then
+        set win to front window of proc
+        set position of win to {{{pos_x}, menuBar}}
+        set size of win to {{halfW, screenH - menuBar}}
+    end if
+end tell'''
+    subprocess.run(["osascript", "-e", script], capture_output=True)
+
 def snap_left():
     if _OS == "Windows":
         pyautogui.hotkey("win", "left")
+    elif _OS == "Darwin":
+        _macos_snap(left=True)
     elif _OS == "Linux":
         try:
             subprocess.run(["wmctrl", "-r", ":ACTIVE:", "-e", "0,0,0,960,1080"],
@@ -211,6 +236,8 @@ def snap_left():
 def snap_right():
     if _OS == "Windows":
         pyautogui.hotkey("win", "right")
+    elif _OS == "Darwin":
+        _macos_snap(left=False)
     elif _OS == "Linux":
         try:
             subprocess.run(["wmctrl", "-r", ":ACTIVE:", "-e", "0,960,0,960,1080"],
@@ -420,6 +447,12 @@ def sleep_display():
 def open_run():
     if _OS == "Windows":
         pyautogui.hotkey("win", "r")
+    elif _OS == "Darwin":
+        # macOS has no Run dialog; Spotlight is the equivalent launcher.
+        pyautogui.hotkey("command", "space")
+    else:
+        # Common Linux run-dialog shortcut (varies by desktop environment).
+        pyautogui.hotkey("alt", "f2")
 
 def dark_mode():
     if _OS == "Darwin":

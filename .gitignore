@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local secrets & config (contains API keys / Gmail app password)
+config/api_keys.json
+
+# Local face-recognition data (biometric model + captured samples)
+face_data/
+
+# Logs & scratch
+*.log

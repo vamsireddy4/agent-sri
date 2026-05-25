@@ -1,6 +1,7 @@
 #computer_control.py
 import io
 import json
+import platform
 import re
 import string
 import subprocess
@@ -40,7 +41,17 @@ def _load_config() -> dict:
         return {}
 
 def _get_os() -> str:
-    return _load_config().get("os_system", "windows").lower()
+    """'windows' | 'mac' | 'linux' — config override, else auto-detect."""
+    override = _load_config().get("os_system")
+    if override:
+        return str(override).lower()
+    return {"Darwin": "mac", "Windows": "windows", "Linux": "linux"} \
+        .get(platform.system(), platform.system().lower())
+
+
+def _mod() -> str:
+    """Primary command modifier for the current OS ('command' on macOS)."""
+    return "command" if _get_os() == "mac" else "ctrl"
 
 
 def _get_api_key() -> str:
@@ -159,7 +170,7 @@ def _smart_type(text: str, clear_first: bool = True) -> str:
     if len(text) > 20 and _PYPERCLIP:
         pyperclip.copy(text)
         time.sleep(0.1)
-        pyautogui.hotkey("ctrl", "v")
+        pyautogui.hotkey(_mod(), "v")
         return f"Smart-typed (clipboard): {text[:60]}{'…' if len(text) > 60 else ''}"
 
     pyautogui.typewrite(text, interval=0.04)
@@ -211,7 +222,7 @@ def _drag(x1: int, y1: int, x2: int, y2: int, duration: float = 0.5) -> str:
 def _clipboard_get() -> str:
     if _PYPERCLIP:
         return pyperclip.paste()
-    _hotkey("ctrl", "c")
+    _hotkey(_mod(), "c")
     time.sleep(0.2)
     return "(copied — pyperclip unavailable for read)"
 
@@ -221,7 +232,7 @@ def _clipboard_paste(text: str) -> str:
         pyperclip.copy(text)
         time.sleep(0.1)
         _require_pyautogui()
-        pyautogui.hotkey("ctrl", "v")
+        pyautogui.hotkey(_mod(), "v")
         return f"Pasted: {text[:60]}{'…' if len(text) > 60 else ''}"
     return "pyperclip not available"
 
@@ -236,7 +247,7 @@ def _screenshot(save_path: str | None = None) -> str:
 
 def _clear_field() -> str:
     _require_pyautogui()
-    pyautogui.hotkey("ctrl", "a")
+    pyautogui.hotkey(_mod(), "a")
     time.sleep(0.1)
     pyautogui.press("delete")
     return "Field cleared"

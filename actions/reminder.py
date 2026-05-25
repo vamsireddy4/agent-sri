@@ -1,5 +1,6 @@
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -13,13 +14,18 @@ def _base_dir() -> Path:
 
 
 def _get_os() -> str:
+    """'windows' | 'mac' | 'linux' — config override, else auto-detect."""
     try:
         cfg = json.loads(
             (_base_dir() / "config" / "api_keys.json").read_text(encoding="utf-8")
         )
-        return cfg.get("os_system", "windows").lower()
+        override = cfg.get("os_system")
+        if override:
+            return str(override).lower()
     except Exception:
-        return "windows"
+        pass
+    return {"Darwin": "mac", "Windows": "windows", "Linux": "linux"} \
+        .get(platform.system(), platform.system().lower())
 
 
 def _scripts_dir() -> Path:

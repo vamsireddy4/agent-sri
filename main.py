@@ -31,6 +31,16 @@ from actions.dev_agent         import dev_agent
 from actions.web_search        import web_search as web_search_action
 from actions.computer_control  import computer_control
 from actions.game_updater      import game_updater
+from actions.system_stats      import system_stats
+from actions.wikipedia_lookup  import wikipedia_lookup
+from actions.dictionary        import define_word
+from actions.joke              import tell_joke
+from actions.news              import news as news_action
+from actions.email_sender      import send_email
+from actions.translate         import translate as translate_action
+from actions.youtube_download  import youtube_download
+from actions.ocr_reader        import ocr_read
+from actions.face_auth         import face_auth
 
 
 def get_base_dir():
@@ -478,6 +488,157 @@ TOOL_DECLARATIONS = [
             "required": ["category", "key", "value"]
         }
     },
+    {
+        "name": "system_stats",
+        "description": (
+            "Reports live system metrics: CPU load, memory/RAM usage, battery level, "
+            "or disk space. Use when the user asks how the computer/PC is doing, "
+            "CPU usage, how much battery/RAM/storage is left, etc."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "metric": {"type": "STRING", "description": "cpu | memory | battery | disk | all (default: all)"}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "wikipedia_lookup",
+        "description": (
+            "Looks up a topic on Wikipedia and returns a short factual summary. "
+            "Use for 'who is', 'what is', 'tell me about', or any encyclopedic question."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "query":     {"type": "STRING", "description": "The topic, person, or thing to look up"},
+                "sentences": {"type": "NUMBER", "description": "How many sentences to return (1-5, default 2)"}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "define_word",
+        "description": "Gives the dictionary definition of an English word.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "word": {"type": "STRING", "description": "The word to define"}
+            },
+            "required": ["word"]
+        }
+    },
+    {
+        "name": "tell_joke",
+        "description": "Tells a random light-hearted programming joke when the user asks for a joke.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "category": {"type": "STRING", "description": "neutral (default) | chuck | all"}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "news",
+        "description": (
+            "Reads the top news headlines. Use when the user asks for news, headlines, "
+            "or what's happening. Can filter by category, country, or a topic keyword."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "count":    {"type": "NUMBER", "description": "Number of headlines (1-10, default 5)"},
+                "category": {"type": "STRING", "description": "business|entertainment|general|health|science|sports|technology"},
+                "country":  {"type": "STRING", "description": "2-letter country code, e.g. us, gb, in (default us)"},
+                "topic":    {"type": "STRING", "description": "Optional keyword to search headlines for"}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "send_email",
+        "description": (
+            "Sends an email via the user's Gmail account. Use when the user asks to "
+            "email someone. The recipient can be an email address or a saved contact name."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "to":      {"type": "STRING", "description": "Recipient email address or saved contact name"},
+                "subject": {"type": "STRING", "description": "Email subject line"},
+                "body":    {"type": "STRING", "description": "The email message body"}
+            },
+            "required": ["to", "body"]
+        }
+    },
+    {
+        "name": "translate",
+        "description": (
+            "Translates text from one language to another. Use when the user asks "
+            "how to say something in another language, or to translate a phrase."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "text":   {"type": "STRING", "description": "The text to translate"},
+                "target": {"type": "STRING", "description": "Target language name or ISO code, e.g. 'spanish' or 'es'"},
+                "source": {"type": "STRING", "description": "Source language (default: auto-detect)"}
+            },
+            "required": ["text", "target"]
+        }
+    },
+    {
+        "name": "youtube_download",
+        "description": (
+            "Downloads a YouTube video or its audio to the Downloads folder. "
+            "Accepts a direct URL or a search query."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "url":   {"type": "STRING", "description": "Direct YouTube video URL"},
+                "query": {"type": "STRING", "description": "Search query (used if no URL given)"},
+                "kind":  {"type": "STRING", "description": "video (default) or audio"}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "ocr_read",
+        "description": (
+            "Extracts raw text from an image using offline OCR (Tesseract). "
+            "Use to read text from an image file, the current screen, or a "
+            "document/page held up to the webcam. This is a fast local text "
+            "reader; for richer visual understanding use screen_process instead."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "source": {"type": "STRING", "description": "file | screen | camera (default: screen)"},
+                "path":   {"type": "STRING", "description": "Path to the image file (when source is 'file')"}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "face_auth",
+        "description": (
+            "Local face recognition for identity verification. Use to enroll a "
+            "person's face under a name, verify/login who is at the webcam, list "
+            "enrolled people, or remove someone. All processing is on-device."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action":  {"type": "STRING", "description": "enroll | verify | list | remove (default: verify)"},
+                "name":    {"type": "STRING", "description": "Person's name (required for enroll and remove)"},
+                "samples": {"type": "NUMBER", "description": "Face samples to capture when enrolling (10-60, default 30)"}
+            },
+            "required": []
+        }
+    },
 ]
 
 class JarvisLive:
@@ -671,6 +832,46 @@ class JarvisLive:
 
             elif name == "flight_finder":
                 r = await loop.run_in_executor(None, lambda: flight_finder(parameters=args, player=self.ui))
+                result = r or "Done."
+
+            elif name == "system_stats":
+                r = await loop.run_in_executor(None, lambda: system_stats(parameters=args, player=self.ui))
+                result = r or "Done."
+
+            elif name == "wikipedia_lookup":
+                r = await loop.run_in_executor(None, lambda: wikipedia_lookup(parameters=args, player=self.ui))
+                result = r or "Done."
+
+            elif name == "define_word":
+                r = await loop.run_in_executor(None, lambda: define_word(parameters=args, player=self.ui))
+                result = r or "Done."
+
+            elif name == "tell_joke":
+                r = await loop.run_in_executor(None, lambda: tell_joke(parameters=args, player=self.ui))
+                result = r or "Done."
+
+            elif name == "news":
+                r = await loop.run_in_executor(None, lambda: news_action(parameters=args, player=self.ui))
+                result = r or "Done."
+
+            elif name == "send_email":
+                r = await loop.run_in_executor(None, lambda: send_email(parameters=args, player=self.ui))
+                result = r or "Done."
+
+            elif name == "translate":
+                r = await loop.run_in_executor(None, lambda: translate_action(parameters=args, player=self.ui))
+                result = r or "Done."
+
+            elif name == "youtube_download":
+                r = await loop.run_in_executor(None, lambda: youtube_download(parameters=args, player=self.ui))
+                result = r or "Done."
+
+            elif name == "ocr_read":
+                r = await loop.run_in_executor(None, lambda: ocr_read(parameters=args, player=self.ui))
+                result = r or "Done."
+
+            elif name == "face_auth":
+                r = await loop.run_in_executor(None, lambda: face_auth(parameters=args, player=self.ui))
                 result = r or "Done."
 
             elif name == "shutdown_jarvis":

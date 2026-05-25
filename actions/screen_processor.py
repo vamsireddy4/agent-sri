@@ -4,6 +4,7 @@ import asyncio
 import base64
 import io
 import json
+import platform
 import re
 import sys
 import threading
@@ -70,7 +71,12 @@ def _get_api_key() -> str:
 
 
 def _get_os() -> str:
-    return _load_config().get("os_system", "windows").lower()
+    """'windows' | 'mac' | 'linux' — config override, else auto-detect."""
+    override = _load_config().get("os_system")
+    if override:
+        return str(override).lower()
+    return {"Darwin": "mac", "Windows": "windows", "Linux": "linux"} \
+        .get(platform.system(), platform.system().lower())
 
 _LIVE_MODEL         = "models/gemini-2.5-flash-native-audio-preview-12-2025"
 _CHANNELS           = 1
