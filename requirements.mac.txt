@@ -8,8 +8,7 @@ duckduckgo-search
 playwright          
 pyautogui
 pyperclip
-pygetwindow       
-opencv-python
+pygetwindow
 numpy
 mss
 Pillow

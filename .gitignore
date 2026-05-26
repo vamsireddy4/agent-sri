@@ -13,6 +13,9 @@ env/
 # Local secrets & config (contains API keys / Gmail app password)
 config/api_keys.json
 
+# Runtime state — last-used language sample (for multilingual wake greeting)
+config/last_language.txt
+
 # Local face-recognition data (biometric model + captured samples)
 face_data/
 

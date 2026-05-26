@@ -1,0 +1,33 @@
+# Agent Sri — Linux dependencies (main app, Python 3.x).
+# Same set as macOS: the Windows-only packages (comtypes, pycaw, win10toast,
+# pywinauto) in requirements.txt are intentionally excluded here.
+#
+# System packages are also required — install_linux.sh installs them:
+#   portaudio (sounddevice), tesseract-ocr, scrot + xdotool (pyautogui),
+#   plus Playwright's browser deps (`playwright install-deps`).
+sounddevice
+google-genai
+google-generativeai
+pillow
+requests
+beautifulsoup4
+duckduckgo-search
+playwright
+pyautogui
+pyperclip
+pygetwindow
+numpy
+mss
+Pillow
+psutil
+send2trash
+youtube-transcript-api
+python-pptx
+pyqt6
+
+# Ported features
+pyjokes
+deep-translator
+yt-dlp
+pytesseract
+opencv-contrib-python

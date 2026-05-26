@@ -8,6 +8,7 @@ import platform
 import shutil
 import subprocess
 import threading
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -19,6 +20,20 @@ from playwright.async_api import (
     TimeoutError as PlaywrightTimeout,
 )
 _OS = platform.system()   # "Windows" | "Darwin" | "Linux"
+
+# Port used to attach to the user's signed-in browser over the Chrome
+# DevTools Protocol. A browser launched (or relaunched) with this port can be
+# driven directly, keeping the user's real profile / login / tabs.
+_CDP_PORT = 9222
+
+
+def _cdp_endpoint_up(port: int) -> bool:
+    """True if a Chromium DevTools endpoint is listening on ``port``."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1) as r:
+            return r.status == 200
+    except Exception:
+        return False
 
 def _normalize_url(url: str) -> str:
     """
@@ -361,6 +376,11 @@ class _BrowserSession:
         self._pw:      Playwright     | None = None
         self._context: BrowserContext | None = None
         self._page:    Page           | None = None
+        # Set when we attach to a running browser over CDP (vs. launching a
+        # persistent context). We must NOT close the user's browser on cleanup
+        # in that case — just disconnect.
+        self._browser = None
+        self._cdp_attached = False
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -394,7 +414,14 @@ class _BrowserSession:
             asyncio.run_coroutine_threadsafe(self._async_close(), self._loop).result(10)
 
     async def _async_close(self):
-        if self._context:
+        # When attached over CDP we only disconnect — never close the user's
+        # real browser out from under them.
+        if self._cdp_attached and self._browser:
+            try:
+                await self._browser.close()
+            except Exception:
+                pass
+        elif self._context:
             try:
                 await self._context.close()
             except Exception:
@@ -404,7 +431,8 @@ class _BrowserSession:
                 await self._pw.stop()
             except Exception:
                 pass
-        self._context = self._page = None
+        self._context = self._page = self._browser = None
+        self._cdp_attached = False
 
     async def _launch(self):
         """
@@ -464,8 +492,18 @@ class _BrowserSession:
             print(f"[Browser] ✅ Safari launched")
             return
 
+        # ── Chromium family (chrome/edge/brave/opera/vivaldi) ───────────────
+        # Goal: drive the user's REAL, signed-in browser — never a fresh blank
+        # profile. Strategy: (1) attach to an already-running debug browser over
+        # CDP, (2) launch the real profile (also exposing the debug port), and
+        # if that profile is locked because the browser is already open without
+        # debugging, quit it once and relaunch, (3) only then fall back.
         profile = _real_profile_dir(self.browser_name)
-
+        label = (
+            f"{self.browser_name}"
+            + (f"/{channel}" if channel else "")
+            + (f" @ {exe}" if exe else "")
+        )
         kwargs = {
             "headless":    False,
             "slow_mo":     0,
@@ -477,40 +515,121 @@ class _BrowserSession:
                 "--no-first-run",
                 "--disable-default-apps",
                 "--no-default-browser-check",
+                "--restore-last-session",
+                f"--remote-debugging-port={_CDP_PORT}",
             ],
         }
-
         if exe:
             kwargs["executable_path"] = exe
         elif channel:
             kwargs["channel"] = channel
 
-        label = (
-            f"{self.browser_name}"
-            + (f"/{channel}" if channel else "")
-            + (f" @ {exe}" if exe else "")
-        )
-
-        try:
-            self._context = await engine_obj.launch_persistent_context(profile, **kwargs)
-            await asyncio.sleep(0.5) 
-            self._page = await self._context.new_page()
-            print(f"[Browser] ✅ Launched [{label}] profile={profile}")
+        # (1) Attach to a running, debug-enabled browser (real signed-in session).
+        browser = await self._try_cdp_connect(engine_obj, _CDP_PORT)
+        if browser is not None:
+            self._browser      = browser
+            self._cdp_attached = True
+            ctx = browser.contexts[0] if browser.contexts else await browser.new_context(no_viewport=True)
+            self._context = ctx
+            open_pages = [p for p in ctx.pages if not p.is_closed()]
+            self._page = open_pages[0] if open_pages else await ctx.new_page()
+            print(f"[Browser] ✅ Attached to your running {label} over CDP (signed-in).")
             return
-        except Exception as e:
-            print(f"[Browser] ⚠️  Real profile failed for {label}: {e}")
 
+        # (2) Launch the real profile. If locked (browser already open without
+        #     debugging), quit it once and retry so we reuse the signed-in profile.
+        for attempt in (1, 2):
+            try:
+                self._context = await engine_obj.launch_persistent_context(profile, **kwargs)
+                await asyncio.sleep(0.5)
+                open_pages = [p for p in self._context.pages if not p.is_closed()]
+                self._page = open_pages[0] if open_pages else await self._context.new_page()
+                print(f"[Browser] ✅ Launched [{label}] with your real signed-in profile.")
+                return
+            except Exception as e:
+                first = str(e).splitlines()[0]
+                locked = any(s in str(e) for s in (
+                    "already in use", "existing browser session",
+                    "ProcessSingleton", "SingletonLock", "Failed to create",
+                ))
+                print(f"[Browser] Real-profile launch failed (try {attempt}): {first}")
+                if attempt == 1 and locked:
+                    print(f"[Browser] {label} is already open — quitting it once to reuse your signed-in profile...")
+                    self._quit_browser_app()
+                    await asyncio.sleep(2.5)
+                    # If a debug port came up meanwhile, attach instead.
+                    browser = await self._try_cdp_connect(engine_obj, _CDP_PORT)
+                    if browser is not None:
+                        self._browser = browser
+                        self._cdp_attached = True
+                        ctx = browser.contexts[0] if browser.contexts else await browser.new_context(no_viewport=True)
+                        self._context = ctx
+                        open_pages = [p for p in ctx.pages if not p.is_closed()]
+                        self._page = open_pages[0] if open_pages else await ctx.new_page()
+                        print(f"[Browser] ✅ Attached to {label} over CDP (signed-in).")
+                        return
+                    continue
+                break
+
+        # (3) Last resort so something works (NOT signed in).
         jarvis_profile = str(Path.home() / ".jarvis_profiles" / self.browser_name)
         Path(jarvis_profile).mkdir(parents=True, exist_ok=True)
-        print(f"[Browser] Retrying with JARVIS profile: {jarvis_profile}")
-
+        print(f"[Browser] ⚠️  Could not use your signed-in profile; falling back to {jarvis_profile}")
         try:
             self._context = await engine_obj.launch_persistent_context(jarvis_profile, **kwargs)
             await asyncio.sleep(0.5)
             self._page = await self._context.new_page()
-            print(f"[Browser] ✅ Launched [{label}] with JARVIS profile")
+            print(f"[Browser] ✅ Launched [{label}] with fallback profile.")
         except Exception as e2:
             raise RuntimeError(f"Could not launch {self.browser_name}: {e2}") from e2
+
+    def _app_display_name(self) -> Optional[str]:
+        """The OS app name used to quit the browser gracefully."""
+        exe = self._spec.get("exe") if self._spec else None
+        if exe and ".app/" in exe:                 # macOS bundle path
+            return exe.split(".app/")[0].split("/")[-1]
+        return {
+            "chrome": "Google Chrome", "edge": "Microsoft Edge",
+            "brave":  "Brave Browser", "opera": "Opera",
+            "operagx": "Opera GX",     "vivaldi": "Vivaldi",
+        }.get(self.browser_name)
+
+    def _quit_browser_app(self):
+        """Best-effort graceful quit so the browser releases its profile lock.
+        Each OS targets the browser differently (macOS app name, Windows image
+        name, Linux process/binary name)."""
+        exe = self._spec.get("exe") if self._spec else None
+        try:
+            if _OS == "Darwin":
+                name = self._app_display_name()
+                if name:
+                    subprocess.run(["osascript", "-e", f'quit app "{name}"'],
+                                   timeout=10, capture_output=True)
+            elif _OS == "Windows":
+                img = Path(exe).name if exe else f"{self.browser_name}.exe"
+                subprocess.run(["taskkill", "/IM", img, "/F"],
+                               timeout=10, capture_output=True)
+            else:  # Linux / other POSIX — match the actual binary name
+                targets = []
+                if exe:
+                    targets.append(Path(exe).name)
+                targets += (self._spec.get("bins") or []) if self._spec else []
+                targets.append(self.browser_name)
+                for t in targets:
+                    if t:
+                        subprocess.run(["pkill", "-f", t], timeout=10, capture_output=True)
+        except Exception as e:
+            print(f"[Browser] Could not quit browser: {e}")
+
+    async def _try_cdp_connect(self, engine_obj, port: int):
+        """Attach to a running Chromium DevTools endpoint; None if unavailable."""
+        if not _cdp_endpoint_up(port):
+            return None
+        try:
+            return await engine_obj.connect_over_cdp(f"http://127.0.0.1:{port}")
+        except Exception as e:
+            print(f"[Browser] CDP connect failed: {e}")
+            return None
 
 
     async def _get_page(self) -> Page:

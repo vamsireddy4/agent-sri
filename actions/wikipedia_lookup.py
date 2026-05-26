@@ -9,7 +9,7 @@ import urllib.parse
 
 import requests
 
-_HEADERS = {"User-Agent": "MarkXXXIX-JARVIS/1.0 (personal assistant)"}
+_HEADERS = {"User-Agent": "AgentSri/1.0 (personal assistant)"}
 _SEARCH_URL = "https://en.wikipedia.org/w/api.php"
 _SUMMARY_URL = "https://en.wikipedia.org/api/rest_v1/page/summary/"
 

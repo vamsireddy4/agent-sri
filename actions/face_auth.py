@@ -15,6 +15,7 @@ Needs cv2.face (opencv-contrib-python). The Haar cascade ships with OpenCV.
 Model + samples are stored under face_data/ next to the app.
 """
 import json
+import platform
 import sys
 import time
 from pathlib import Path
@@ -27,6 +28,17 @@ try:
 except ImportError:
     _CV2 = False
     _HAS_FACE = False
+
+_IS_WINDOWS = platform.system() == "Windows"
+
+
+def _open_camera(index: int = 0):
+    """Open the webcam with the most reliable backend per platform.
+
+    Windows opens far faster (and without warnings) via DirectShow."""
+    if _IS_WINDOWS:
+        return cv2.VideoCapture(index, cv2.CAP_DSHOW)
+    return cv2.VideoCapture(index)
 
 # Lower LBPH confidence == better match (0 is a perfect match).
 _MATCH_THRESHOLD = 70.0
@@ -77,7 +89,7 @@ def _detector():
 def _capture_face_crops(num_samples: int, timeout_s: float = 20.0):
     """Open the webcam and collect up to num_samples grayscale face crops."""
     detector = _detector()
-    cam = cv2.VideoCapture(0)
+    cam = _open_camera(0)
     if not cam.isOpened():
         return None, "Could not access the webcam."
 
@@ -163,7 +175,7 @@ def _verify(threshold: float) -> str:
     recognizer.read(str(_model_path()))
     detector = _detector()
 
-    cam = cv2.VideoCapture(0)
+    cam = _open_camera(0)
     if not cam.isOpened():
         return "Could not access the webcam."
 

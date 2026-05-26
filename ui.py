@@ -251,7 +251,7 @@ class HudCanvas(QWidget):
 
         self.muted    = False
         self.speaking = False
-        self.state    = "INITIALISING"
+        self.state    = "ASLEEP"
 
         self._tick       = 0
         self._scale      = 1.0
@@ -268,10 +268,16 @@ class HudCanvas(QWidget):
         self._particles: list[list[float]] = []
         self._face_px: QPixmap | None = None
         self._load_face(face_path)
+        self.on_click = None       # set by the window → wake from standby
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         self._tmr = QTimer(self)
         self._tmr.timeout.connect(self._step)
         self._tmr.start(16)
+
+    def mousePressEvent(self, _):
+        if callable(self.on_click):
+            self.on_click()
 
     def _load_face(self, path: str):
         try:
@@ -293,7 +299,14 @@ class HudCanvas(QWidget):
     def _step(self):
         self._tick += 1
         now = time.time()
-        if now - self._last_t > (0.12 if self.speaking else 0.5):
+        asleep = (self.state == "ASLEEP")
+
+        if asleep:
+            # Slow "breathing" while dormant.
+            breath = 0.5 + 0.5 * math.sin(self._tick * 0.045)
+            self._tgt_scale = 0.82 + 0.04 * breath
+            self._tgt_halo  = 9 + 16 * breath
+        elif now - self._last_t > (0.12 if self.speaking else 0.5):
             if self.speaking:
                 self._tgt_scale = random.uniform(1.06, 1.14)
                 self._tgt_halo  = random.uniform(145, 190)
@@ -305,25 +318,33 @@ class HudCanvas(QWidget):
                 self._tgt_halo  = random.uniform(48, 68)
             self._last_t = now
 
-        sp = 0.38 if self.speaking else 0.15
+        sp = 0.10 if asleep else (0.38 if self.speaking else 0.15)
         self._scale += (self._tgt_scale - self._scale) * sp
         self._halo  += (self._tgt_halo  - self._halo)  * sp
 
-        speeds = [1.3, -0.9, 2.0] if self.speaking else [0.55, -0.35, 0.9]
+        if asleep:
+            speeds = [0.14, -0.10, 0.22]
+        elif self.speaking:
+            speeds = [1.3, -0.9, 2.0]
+        else:
+            speeds = [0.55, -0.35, 0.9]
         for i, spd in enumerate(speeds):
             self._rings[i] = (self._rings[i] + spd) % 360
 
-        self._scan  = (self._scan  + (3.0 if self.speaking else 1.3)) % 360
-        self._scan2 = (self._scan2 + (-2.0 if self.speaking else -0.75)) % 360
+        self._scan  = (self._scan  + (0.3 if asleep else (3.0 if self.speaking else 1.3))) % 360
+        self._scan2 = (self._scan2 + (-0.2 if asleep else (-2.0 if self.speaking else -0.75))) % 360
 
         fw  = min(self.width(), self.height())
         lim = fw * 0.74
         spd = 4.2 if self.speaking else 2.0
-        self._pulses = [r + spd for r in self._pulses if r + spd < lim]
-        if len(self._pulses) < 3 and random.random() < (0.07 if self.speaking else 0.025):
-            self._pulses.append(0.0)
+        if asleep:
+            self._pulses = []
+        else:
+            self._pulses = [r + spd for r in self._pulses if r + spd < lim]
+            if len(self._pulses) < 3 and random.random() < (0.07 if self.speaking else 0.025):
+                self._pulses.append(0.0)
 
-        if self.speaking and random.random() < 0.28:
+        if (not asleep) and self.speaking and random.random() < 0.28:
             cx, cy = self.width() / 2, self.height() / 2
             ang = random.uniform(0, 2 * math.pi)
             r_s = fw * 0.28
@@ -338,7 +359,7 @@ class HudCanvas(QWidget):
         ]
 
         self._blink_tick += 1
-        if self._blink_tick >= 38:
+        if self._blink_tick >= (60 if asleep else 38):
             self._blink = not self._blink
             self._blink_tick = 0
         self.update()
@@ -352,8 +373,12 @@ class HudCanvas(QWidget):
         cx, cy = W / 2, H / 2
         fw = min(W, H)
 
+        # overall brightness level — low while dormant, full when awake/speaking
+        lvl = min(1.0, max(0.10, self._halo / 90.0))
+        def _a(base): return max(0, min(255, int(base * lvl)))
+
         # grid dots
-        p.setPen(QPen(qcol(C.PRI_GHO), 1))
+        p.setPen(QPen(qcol(C.PRI_GHO, _a(255)), 1))
         for x in range(0, W, 48):
             for y in range(0, H, 48):
                 p.drawPoint(x, y)
@@ -404,7 +429,7 @@ class HudCanvas(QWidget):
 
         # tick marks
         t_out, t_in = fw * 0.497, fw * 0.474
-        p.setPen(QPen(qcol(C.PRI, 140), 1))
+        p.setPen(QPen(qcol(C.PRI, _a(140)), 1))
         for deg in range(0, 360, 10):
             rad = math.radians(deg)
             inn = t_in if deg % 30 == 0 else t_in + 6
@@ -431,29 +456,58 @@ class HudCanvas(QWidget):
             p.drawLine(QPointF(bx, by), QPointF(bx + dx * bl, by))
             p.drawLine(QPointF(bx, by), QPointF(bx, by + dy * bl))
 
-        # face
-        if self._face_px:
-            fsz    = int(fw * 0.62 * self._scale)
-            scaled = self._face_px.scaled(
-                fsz, fsz,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            p.drawPixmap(int(cx - fsz / 2), int(cy - fsz / 2), scaled)
+        # ── central iris / eye (the JARVIS core) ─────────────────────────
+        core_r = fw * 0.205 * self._scale
+        ctr    = QPointF(cx, cy)
+
+        # outer soft sphere glow
+        g_out = QRadialGradient(ctr, core_r * 1.75)
+        g_out.setColorAt(0.0, QColor(12, 70, 82, _a(190)))
+        g_out.setColorAt(0.55, QColor(6, 34, 42, _a(150)))
+        g_out.setColorAt(1.0, QColor(0, 6, 10, 0))
+        p.setPen(Qt.PenStyle.NoPen); p.setBrush(QBrush(g_out))
+        p.drawEllipse(ctr, core_r * 1.75, core_r * 1.75)
+
+        # iris body — bright cyan/teal (red-tinted when muted), dark pupil center
+        g_iris = QRadialGradient(ctr, core_r)
+        if self.muted:
+            g_iris.setColorAt(0.00, QColor(20, 0, 6, _a(255)))
+            g_iris.setColorAt(0.30, QColor(120, 10, 30, _a(220)))
+            g_iris.setColorAt(0.60, QColor(255, 60, 95, _a(240)))
+            g_iris.setColorAt(0.84, QColor(120, 8, 28, _a(175)))
+            g_iris.setColorAt(1.00, QColor(40, 4, 12, _a(110)))
+            rim = QColor(255, 120, 150, _a(235))
         else:
-            orb_r = int(fw * 0.27 * self._scale)
-            oc    = (200, 0, 50) if self.muted else (0, 60, 110)
-            for i in range(8, 0, -1):
-                r2  = int(orb_r * i / 8)
-                frc = i / 8
-                a   = max(0, min(255, int(self._halo * 1.1 * frc)))
-                p.setBrush(QBrush(QColor(int(oc[0]*frc), int(oc[1]*frc), int(oc[2]*frc), a)))
-                p.setPen(Qt.PenStyle.NoPen)
-                p.drawEllipse(QRectF(cx - r2, cy - r2, r2 * 2, r2 * 2))
-            p.setPen(QPen(qcol(C.PRI, min(255, int(self._halo * 2))), 1))
-            p.setFont(QFont("Courier New", 13, QFont.Weight.Bold))
-            p.drawText(QRectF(cx - 80, cy - 14, 160, 28),
-                       Qt.AlignmentFlag.AlignCenter, "J.A.R.V.I.S")
+            g_iris.setColorAt(0.00, QColor(2, 16, 21, _a(255)))     # dark pupil
+            g_iris.setColorAt(0.26, QColor(10, 150, 165, _a(225)))
+            g_iris.setColorAt(0.58, QColor(70, 224, 255, _a(245)))  # bright cyan
+            g_iris.setColorAt(0.84, QColor(12, 150, 185, _a(180)))
+            g_iris.setColorAt(1.00, QColor(6, 60, 72, _a(120)))
+            rim = QColor(150, 244, 255, _a(235))
+        p.setBrush(QBrush(g_iris))
+        p.drawEllipse(ctr, core_r, core_r)
+
+        # bright rim ring
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(rim, 2.0))
+        p.drawEllipse(ctr, core_r, core_r)
+
+        # inner radial tick marks (slowly rotating)
+        p.setPen(QPen(QColor(rim.red(), rim.green(), rim.blue(), _a(200)), 2))
+        r1, r2 = core_r * 0.60, core_r * 0.80
+        for deg in range(0, 360, 9):
+            rad = math.radians(deg + self._rings[2] * 0.2)
+            p.drawLine(
+                QPointF(cx + r1 * math.cos(rad), cy - r1 * math.sin(rad)),
+                QPointF(cx + r2 * math.cos(rad), cy - r2 * math.sin(rad)),
+            )
+
+        # dark pupil center
+        g_pup = QRadialGradient(ctr, core_r * 0.42)
+        g_pup.setColorAt(0.0, QColor(0, 4, 6, _a(255)))
+        g_pup.setColorAt(1.0, QColor(0, 4, 6, 0))
+        p.setPen(Qt.PenStyle.NoPen); p.setBrush(QBrush(g_pup))
+        p.drawEllipse(ctr, core_r * 0.42, core_r * 0.42)
 
         # particles
         for pt in self._particles:
@@ -464,7 +518,13 @@ class HudCanvas(QWidget):
 
         # status text
         sy = cy + fw * 0.40
-        if self.muted:
+        if self.state == "ASLEEP":
+            sym = "◌" if self._blink else "○"
+            txt, col = f"{sym}  CLAP OR SNAP TO WAKE", qcol(C.PRI, _a(255))
+        elif self.state == "WAKING":
+            sym = "⟳" if self._blink else "⟲"
+            txt, col = f"{sym}  WAKING…", qcol(C.PRI)
+        elif self.muted:
             txt, col = "⊘  MUTED",     qcol(C.MUTED_C)
         elif self.speaking:
             txt, col = "●  SPEAKING",  qcol(C.ACC)
@@ -607,7 +667,7 @@ class LogWidget(QTextEdit):
         self._pos    = 0
         tl = self._text.lower()
         if   tl.startswith("you:"):    self._tag = "you"
-        elif tl.startswith("jarvis:"): self._tag = "ai"
+        elif tl.startswith("sri:"):    self._tag = "ai"
         elif tl.startswith("file:"):   self._tag = "file"
         elif "err" in tl:              self._tag = "err"
         else:                          self._tag = "sys"
@@ -733,7 +793,7 @@ class FileDropZone(QWidget):
 
     def _browse(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select a file for JARVIS", str(Path.home()),
+            self, "Select a file for Sri", str(Path.home()),
             "All Files (*.*);;"
             "Images (*.jpg *.jpeg *.png *.gif *.webp *.bmp *.svg);;"
             "Documents (*.pdf *.docx *.txt *.md *.pptx);;"
@@ -888,7 +948,7 @@ class SetupOverlay(QWidget):
             return w
 
         layout.addWidget(_lbl("◈  INITIALISATION REQUIRED", 13, True))
-        layout.addWidget(_lbl("Configure J.A.R.V.I.S. before first boot.", 9, color=C.PRI_DIM))
+        layout.addWidget(_lbl("Configure Sri before first boot.", 9, color=C.PRI_DIM))
         layout.addSpacing(6)
 
         sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
@@ -990,7 +1050,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self, face_path: str):
         super().__init__()
-        self.setWindowTitle("J.A.R.V.I.S — MARK XXXIX")
+        self.setWindowTitle("Agent Sri")
         self.setMinimumSize(_MIN_W, _MIN_H)
         self.resize(_DEFAULT_W, _DEFAULT_H)
 
@@ -1041,7 +1101,7 @@ class MainWindow(QMainWindow):
         self._metric_tmr.start(2000)
         self._update_metrics()
 
-        self._log_sig.connect(self._log.append_log)
+        self._log_sig.connect(self._log_line)
         self._state_sig.connect(self._apply_state)
 
         self._overlay: SetupOverlay | None = None
@@ -1054,6 +1114,96 @@ class MainWindow(QMainWindow):
         sc_full = QShortcut(QKeySequence("F11"), self)
         sc_full.activated.connect(self._toggle_fullscreen)
 
+        # ── minimal iris-centric mode + clap/click/key wake ──────────────
+        self.on_wake       = None        # set by JarvisLive
+        self._panels_shown = False       # full dashboard hidden by default
+        self.hud.on_click  = self._request_wake_ui
+
+        self._cmd_overlay = self._build_cmd_overlay(self.centralWidget())
+        self._log_overlay = self._build_log_overlay(self.centralWidget())
+
+        sc_wake = QShortcut(QKeySequence("Space"), self)
+        sc_wake.activated.connect(self._request_wake_ui)
+        sc_panels = QShortcut(QKeySequence("P"), self)
+        sc_panels.activated.connect(self._toggle_panels)
+
+        self._relayout()
+
+    def _request_wake_ui(self):
+        if callable(self.on_wake):
+            self.on_wake()
+
+    def _toggle_panels(self):
+        self._panels_shown = not self._panels_shown
+        self._relayout()
+
+    def _relayout(self):
+        """Apply minimal (iris-only) vs full-dashboard layout."""
+        show_panels = self._panels_shown
+        self._left_panel.setVisible(show_panels)
+        self._right_panel.setVisible(show_panels)
+        asleep = (self.hud.state == "ASLEEP")
+        show_overlay = (not show_panels) and (not asleep)
+        self._cmd_overlay.setVisible(show_overlay)
+        self._log_overlay.setVisible(show_overlay)
+        if show_overlay:
+            self._position_overlays()
+
+    def _position_overlays(self):
+        cw = self.centralWidget()
+        if cw is None:
+            return
+        W, H = cw.width(), cw.height()
+        ow = min(560, int(W * 0.62))
+        # command bar near the bottom, log strip just above it
+        self._cmd_overlay.setGeometry((W - ow) // 2, H - 96, ow, 38)
+        self._log_overlay.setGeometry((W - ow) // 2, H - 96 - 116, ow, 110)
+        self._log_overlay.raise_()
+        self._cmd_overlay.raise_()
+
+    def _build_cmd_overlay(self, parent) -> QWidget:
+        f = QFrame(parent)
+        f.setStyleSheet(
+            f"QFrame {{ background: rgba(1,13,20,210); "
+            f"border: 1px solid {C.BORDER_B}; border-radius: 6px; }}"
+        )
+        lay = QHBoxLayout(f)
+        lay.setContentsMargins(12, 3, 6, 3); lay.setSpacing(6)
+
+        self._mini_input = QLineEdit()
+        self._mini_input.setPlaceholderText("Speak, or type a command…")
+        self._mini_input.setFont(QFont("Courier New", 10))
+        self._mini_input.setStyleSheet(
+            f"QLineEdit {{ background: transparent; color: {C.WHITE}; border: none; }}"
+        )
+        self._mini_input.returnPressed.connect(self._send_mini)
+        lay.addWidget(self._mini_input, stretch=1)
+
+        self._mini_mute = QPushButton("🎙")
+        self._mini_mute.setFixedSize(30, 28)
+        self._mini_mute.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._mini_mute.clicked.connect(self._toggle_mute)
+        lay.addWidget(self._mini_mute)
+
+        f.hide()
+        return f
+
+    def _build_log_overlay(self, parent) -> "LogWidget":
+        lw = LogWidget(parent)
+        lw.setReadOnly(True)
+        lw.setStyleSheet(
+            f"QTextEdit {{ background: rgba(0,8,12,150); color: {C.TEXT}; "
+            f"border: 1px solid {C.BORDER}; border-radius: 6px; padding: 4px; }}"
+        )
+        lw.hide()
+        return lw
+
+    def _boot_sequence(self):
+        lines = ["⚡ POWERING ON…", "◈ NEURAL CORE ONLINE",
+                 "◈ SENSORS NOMINAL", "◈ SYSTEMS READY"]
+        for i, ln in enumerate(lines):
+            QTimer.singleShot(i * 480, lambda t=ln: self._log_line(f"SYS: {t}"))
+
     def _toggle_fullscreen(self):
         if self.isFullScreen():
             self.showNormal()
@@ -1062,7 +1212,7 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if self._overlay and self._overlay.isVisible():
+        if getattr(self, "_overlay", None) and self._overlay.isVisible():
             ow, oh = 460, 390
             cw = self.centralWidget()
             self._overlay.setGeometry(
@@ -1070,6 +1220,8 @@ class MainWindow(QMainWindow):
                 (cw.height() - oh) // 2,
                 ow, oh,
             )
+        if getattr(self, "_cmd_overlay", None) and self._cmd_overlay.isVisible():
+            self._position_overlays()
 
     def _update_metrics(self):
         snap = _metrics.snapshot()
@@ -1135,11 +1287,11 @@ class MainWindow(QMainWindow):
             l.setStyleSheet(f"color: {color}; background: transparent;")
             return l
 
-        lay.addWidget(_badge("MARK XXXIX", C.PRI_DIM))
+        lay.addWidget(_badge("AGENT SRI", C.PRI_DIM))
         lay.addStretch()
 
         mid = QVBoxLayout(); mid.setSpacing(1)
-        title = QLabel("J.A.R.V.I.S")
+        title = QLabel("SRI")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setFont(QFont("Courier New", 17, QFont.Weight.Bold))
         title.setStyleSheet(f"color: {C.PRI}; background: transparent;")
@@ -1347,9 +1499,9 @@ class MainWindow(QMainWindow):
             l.setStyleSheet(f"color: {color}; background: transparent;")
             return l
 
-        lay.addWidget(_fl("[F4] Mute  ·  [F11] Fullscreen"))
+        lay.addWidget(_fl("[Space] Wake  ·  [P] Panels  ·  [F4] Mute  ·  [F11] Fullscreen"))
         lay.addStretch()
-        lay.addWidget(_fl("FatihMakes Industries  ·  MARK XXXIX  ·  CLASSIFIED"))
+        lay.addWidget(_fl("FatihMakes Industries  ·  AGENT SRI  ·  CLASSIFIED"))
         lay.addStretch()
         lay.addWidget(_fl("© FATIHMAKES", C.PRI_DIM))
         return w
@@ -1360,12 +1512,20 @@ class MainWindow(QMainWindow):
         cat  = _file_category(p)
         icon, _ = _FILE_ICONS.get(cat, _FILE_ICONS["unknown"])
         size = _fmt_size(p.stat().st_size)
-        self._file_hint.setText(f"{icon}  {p.name}  ·  {size}  ·  Tell JARVIS what to do with it")
+        self._file_hint.setText(f"{icon}  {p.name}  ·  {size}  ·  Tell Sri what to do with it")
         self._log.append_log(f"FILE: {p.name} ({size}) loaded")
         if self.on_text_command:
+            extra = ""
+            if cat == "audio":
+                extra = (
+                    "This is an audio file, so the user may want to use it as your "
+                    "speaking/cloned voice. If they ask for that, call set_voice_sample "
+                    f"with path={path}. "
+                )
             msg = (
                 f"[FILE_UPLOADED] path={path} | name={p.name} | "
                 f"type={p.suffix.lstrip('.')} | size={size} | "
+                f"{extra}"
                 f"Briefly tell the user you can see the file '{p.name}' "
                 f"({size}) has been uploaded and ask what they'd like to do with it."
             )
@@ -1377,10 +1537,10 @@ class MainWindow(QMainWindow):
         self._style_mute_btn()
         if self._muted:
             self._apply_state("MUTED")
-            self._log.append_log("SYS: Microphone muted.")
+            self._log_line("SYS: Microphone muted.")
         else:
             self._apply_state("LISTENING")
-            self._log.append_log("SYS: Microphone active.")
+            self._log_line("SYS: Microphone active.")
 
     def _style_mute_btn(self):
         if self._muted:
@@ -1400,18 +1560,46 @@ class MainWindow(QMainWindow):
                 }}
                 QPushButton:hover {{ background: #001f10; }}
             """)
+        if hasattr(self, "_mini_mute"):
+            mc = C.MUTED_C if self._muted else C.GREEN
+            self._mini_mute.setText("🔇" if self._muted else "🎙")
+            self._mini_mute.setStyleSheet(
+                f"QPushButton {{ background: transparent; color: {mc}; "
+                f"border: 1px solid {mc}; border-radius: 4px; }}"
+            )
 
     def _send(self):
         txt = self._input.text().strip()
-        if not txt: return
         self._input.clear()
-        self._log.append_log(f"You: {txt}")
+        self._dispatch_text(txt)
+
+    def _send_mini(self):
+        txt = self._mini_input.text().strip()
+        self._mini_input.clear()
+        self._dispatch_text(txt)
+
+    def _dispatch_text(self, txt: str):
+        if not txt:
+            return
+        self._log_line(f"You: {txt}")
         if self.on_text_command:
             threading.Thread(target=self.on_text_command, args=(txt,), daemon=True).start()
 
+    def _log_line(self, text: str):
+        """Route a log line to the full log and the minimal overlay."""
+        self._log.append_log(text)
+        ov = getattr(self, "_log_overlay", None)
+        if ov is not None:
+            ov.append_log(text)
+
     def _apply_state(self, state: str):
+        prev = self.hud.state
         self.hud.state    = state
         self.hud.speaking = (state == "SPEAKING")
+        if hasattr(self, "_cmd_overlay"):
+            self._relayout()
+        if state == "WAKING" and prev != "WAKING":
+            self._boot_sequence()
 
     def _check_config(self) -> bool:
         if not API_FILE.exists(): return False
@@ -1445,7 +1633,7 @@ class MainWindow(QMainWindow):
             self._overlay.hide()
             self._overlay = None
         self._apply_state("LISTENING")
-        self._log.append_log(f"SYS: Initialised. OS={os_name.upper()}. JARVIS online.")
+        self._log.append_log(f"SYS: Initialised. OS={os_name.upper()}. Sri online.")
 
 class _RootShim:
     def __init__(self, app: QApplication):
@@ -1484,6 +1672,14 @@ class JarvisUI:
     @on_text_command.setter
     def on_text_command(self, cb):
         self._win.on_text_command = cb
+
+    @property
+    def on_wake(self):
+        return self._win.on_wake
+
+    @on_wake.setter
+    def on_wake(self, cb):
+        self._win.on_wake = cb
 
     def set_state(self, state: str):
         self._win._state_sig.emit(state)

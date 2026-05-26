@@ -3,9 +3,12 @@ import re
 import threading
 import json
 import sys
+import time
 import traceback
+from collections import deque
 from pathlib import Path
 
+import numpy as np
 import sounddevice as sd
 from google import genai
 from google.genai import types
@@ -41,6 +44,11 @@ from actions.translate         import translate as translate_action
 from actions.youtube_download  import youtube_download
 from actions.ocr_reader        import ocr_read
 from actions.face_auth         import face_auth
+from actions.geolocation       import my_location
+from actions.maps_search       import maps_search
+from actions.price_tracker     import track_price
+from actions.voice_switch      import resolve_voice
+from core.voice_engine         import VoiceEngine
 
 
 def get_base_dir():
@@ -52,11 +60,75 @@ def get_base_dir():
 BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
+LANG_SAMPLE_PATH = BASE_DIR / "config" / "last_language.txt"
 LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-preview-12-2025"
 CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE          = 1024
+
+
+class _ClapDetector:
+    """Detects a wake sound — a single clap OR a finger snap — in a stream of
+    int16 PCM chunks. Used to wake JARVIS from standby.
+
+    A clap and a snap are both brief, sharp transients after quiet; a snap is
+    just quieter and shorter than a clap. So instead of an absolute loudness
+    threshold we look for an *onset*: a sudden peak that is (a) above a small
+    floor, and (b) many times louder than the quiet moments just before it.
+    Requiring a settled-quiet baseline first rejects speech, steady noise, and
+    the mic's startup transient. `sensitivity` (0..1) eases both conditions.
+    """
+
+    _INT16_MAX = 32767.0
+
+    def __init__(self, sensitivity: float = 0.6):
+        self.set_sensitivity(sensitivity)
+        self._recent = deque(maxlen=6)     # ~0.4s of recent chunk RMS
+        self._cooldown_until = 0.0
+
+    def set_sensitivity(self, s: float):
+        s = max(0.0, min(1.0, float(s)))
+        # Absolute floor: low enough for a finger snap, high enough to ignore
+        # tiny noises. Onset ratio: peak must dwarf the recent quiet baseline.
+        self.peak_floor   = self._INT16_MAX * (0.26 - 0.16 * s)   # ~ 8500..3300
+        self.onset_ratio  = 9.0 - 4.0 * s                          # ~ 9x..5x
+        self.quiet_rms    = 2400.0          # "was it quiet just before?" gate
+
+    def reset(self, cooldown: float = 2.5):
+        self._recent.clear()
+        self._cooldown_until = time.time() + cooldown
+
+    def feed(self, chunk: "np.ndarray") -> bool:
+        now = time.time()
+        x = chunk.astype(np.float32)
+        peak = float(np.abs(x).max())
+        rms  = float(np.sqrt(np.mean(x * x)))
+
+        # Need a settled, genuinely-quiet baseline (full history) before a spike
+        # counts — this rejects the mic's startup transient and steady noise.
+        baseline = (sum(self._recent) / len(self._recent)) if self._recent else 0.0
+        was_quiet = (len(self._recent) >= self._recent.maxlen and
+                     baseline < self.quiet_rms)
+        self._recent.append(rms)
+
+        if now < self._cooldown_until:
+            return False
+        # Sudden onset: loud enough AND a sharp jump above the quiet baseline.
+        sudden = peak >= self.peak_floor and peak >= self.onset_ratio * max(baseline, 180.0)
+        if sudden and was_quiet:
+            self._cooldown_until = now + 1.2
+            return True
+        return False
+
+
+def _clap_sensitivity() -> float:
+    try:
+        cfg = json.loads(API_CONFIG_PATH.read_text(encoding="utf-8"))
+        return float(cfg.get("clap_sensitivity", 0.6))
+    except Exception:
+        return 0.6
+
 
 def _get_api_key() -> str:
     with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -68,14 +140,45 @@ def _load_system_prompt() -> str:
         return PROMPT_PATH.read_text(encoding="utf-8")
     except Exception:
         return (
-            "You are JARVIS, Tony Stark's AI assistant. "
+            "You are Sri, the user's own personal AI assistant. "
             "Be concise, direct, and always use the provided tools to complete tasks. "
             "Never simulate or guess results — always call the appropriate tool."
         )
 
+
+def _load_lang_sample() -> str:
+    """A short sample of the user's last utterance, used so the wake greeting
+    can be spoken in their language even after a restart."""
+    try:
+        return LANG_SAMPLE_PATH.read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
+
+
+def _save_lang_sample(text: str) -> None:
+    try:
+        LANG_SAMPLE_PATH.write_text(text.strip()[:160], encoding="utf-8")
+    except Exception:
+        pass
+
 _CTRL_RE = re.compile(r"<ctrl\d+>", re.IGNORECASE)
 
-def _clean_transcript(text: str) -> str:    
+
+class _VoiceSwitch(Exception):
+    """Raised internally to break the live session so it reconnects with a
+    different Gemini voice (used by the switch_voice tool)."""
+
+
+def _is_voice_switch(exc: BaseException) -> bool:
+    """True if exc is (or an ExceptionGroup containing) a _VoiceSwitch."""
+    if isinstance(exc, _VoiceSwitch):
+        return True
+    if isinstance(exc, BaseExceptionGroup):
+        return any(_is_voice_switch(e) for e in exc.exceptions)
+    return False
+
+
+def _clean_transcript(text: str) -> str:
     text = _CTRL_RE.sub("", text)
     text = re.sub(r"[\x00-\x08\x0b-\x1f]", "", text)
     return text.strip()
@@ -115,13 +218,18 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "weather_report",
-        "description": "Gives the weather report to user",
+        "description": (
+            "Reports live weather (temperature, feels-like, humidity, wind, and "
+            "sky conditions). If no city is given, uses the user's current "
+            "location. Use whenever the user asks about the weather."
+        ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "city": {"type": "STRING", "description": "City name"}
+                "city": {"type": "STRING", "description": "City name (optional; omit to use current location)"},
+                "time": {"type": "STRING", "description": "Optional time qualifier, e.g. 'now' or 'today'"}
             },
-            "required": ["city"]
+            "required": []
         }
     },
     {
@@ -639,6 +747,92 @@ TOOL_DECLARATIONS = [
             "required": []
         }
     },
+    {
+        "name": "my_location",
+        "description": (
+            "Reports the user's approximate current location (city, region, "
+            "country) and latitude/longitude via IP geolocation. Use for "
+            "'where am I', 'what's my location', or 'my latitude and longitude'."
+        ),
+        "parameters": {"type": "OBJECT", "properties": {}, "required": []}
+    },
+    {
+        "name": "maps_search",
+        "description": (
+            "Opens Google Maps for a place, or directions between two places. "
+            "Use for 'show me X on the map', 'where is X', or 'directions from "
+            "A to B'."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "query":       {"type": "STRING", "description": "A place or address to locate on the map"},
+                "origin":      {"type": "STRING", "description": "Start point for directions (optional)"},
+                "destination": {"type": "STRING", "description": "End point for directions"}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "track_price",
+        "description": (
+            "Checks the current price of an online product from its URL "
+            "(Amazon and similar shops). Optionally compares against a target "
+            "price and emails an alert if the price is at or below it."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "url":          {"type": "STRING", "description": "Full product page URL"},
+                "target":       {"type": "NUMBER", "description": "Optional target price to compare against"},
+                "notify_email": {"type": "STRING", "description": "Optional email/contact to alert if price is at/below target"}
+            },
+            "required": ["url"]
+        }
+    },
+    {
+        "name": "switch_voice",
+        "description": (
+            "Switches the assistant's voice. Sri only ever uses a FEMALE voice. "
+            "Use when the user asks to switch to a different female voice. The "
+            "session briefly reconnects to apply the new voice. Male voices are "
+            "not available."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "voice": {"type": "STRING", "description": "A female Gemini voice: Aoede (default) | Kore | Leda | Zephyr"}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "set_voice_sample",
+        "description": (
+            "Clones the assistant's speaking voice from an audio file the user "
+            "uploaded or pointed to. Use when the user says to use a specific "
+            "audio file / recording / sample as the voice, or uploads an audio "
+            "clip to be used as the voice. Works for languages XTTS supports "
+            "(e.g. English, Hindi)."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "path": {"type": "STRING", "description": "Absolute path to the audio file (mp3/wav) to clone the voice from"}
+            },
+            "required": ["path"]
+        }
+    },
+    {
+        "name": "standby",
+        "description": (
+            "Puts the assistant into standby / sleep mode. Use when the user "
+            "says go to sleep, standby, power down, that's all, or goodbye for "
+            "now. After this, the assistant waits silently for a clap or finger "
+            "snap to wake."
+        ),
+        "parameters": {"type": "OBJECT", "properties": {}, "required": []}
+    },
 ]
 
 class JarvisLive:
@@ -653,6 +847,24 @@ class JarvisLive:
         self._speaking_lock = threading.Lock()
         self.ui.on_text_command = self._on_text_command
         self._turn_done_event: asyncio.Event | None = None
+        # Voice/persona (switch_voice tool). Default Sri = Aoede.
+        self.voice_name          = "Aoede"
+        self.persona             = "Sri"
+        self._reconnect_event: asyncio.Event | None = None
+        self._announce_voice     = False
+        # Standby / clap-to-wake. Starts asleep; a clap (or wake hook) wakes it.
+        self.asleep              = True
+        self._woke_at            = 0.0
+        self._clap               = _ClapDetector(_clap_sensitivity())
+        self.ui.on_wake          = self._request_wake
+        # Last user utterance sample → lets the wake greeting match their
+        # language across restarts. Restored from disk on launch.
+        self._last_user_text     = _load_lang_sample()
+        # Cloned-voice TTS (XTTS-v2). Defaults to the Anika reference voice.
+        # Until the worker is ready (or for languages XTTS can't speak), Sri
+        # falls back to Gemini's built-in voice automatically.
+        self.voice_engine        = VoiceEngine()
+        self.voice_engine.start()
 
     def _on_text_command(self, text: str):
         if not self._loop or not self.session:
@@ -689,6 +901,95 @@ class JarvisLive:
         self.ui.write_log(f"ERR: {tool_name} — {short}")
         self.speak(f"Sir, {tool_name} encountered an error. {short}")
 
+    def _enqueue_pcm(self, pcm: bytes):
+        """Push synthesized 24kHz int16 PCM into the playback queue in
+        playback-sized chunks so set_speaking() toggles smoothly."""
+        step = CHUNK_SIZE * 2          # int16 mono -> 2 bytes/frame
+        for i in range(0, len(pcm), step):
+            self.audio_in_queue.put_nowait(pcm[i:i + step])
+
+    def set_voice_sample(self, args: dict) -> str:
+        """Switch the cloned voice to a user-supplied audio file (upload)."""
+        path = str(args.get("path") or args.get("file") or "").strip()
+        if not path:
+            return "I didn't get an audio file path to clone the voice from, sir."
+        if self.voice_engine.set_speaker(path):
+            name = Path(path).name
+            self.ui.write_log(f"SYS: Voice sample set to {name}.")
+            return (f"Got it — I'll speak using the voice from {name} from now on. "
+                    f"Note this works for supported languages like English and Hindi.")
+        return f"I couldn't find that audio file, sir: {path}"
+
+    def _switch_voice(self, args: dict) -> str:
+        """Apply a new voice/persona and trigger a session reconnect."""
+        choice = resolve_voice(args)
+        if choice["voice"] == self.voice_name:
+            return f"I'm already using the {self.persona} voice, sir."
+
+        self.voice_name      = choice["voice"]
+        self.persona         = choice["persona"]
+        self._announce_voice = True
+        self.ui.write_log(f"SYS: Switching voice to {self.persona} ({self.voice_name}).")
+
+        # Break the current session so run() reconnects with the new voice.
+        if self._reconnect_event is not None:
+            self._reconnect_event.set()
+        return f"Switching to the {self.persona} voice now, sir."
+
+    # ── Standby / clap-to-wake ─────────────────────────────────────────────
+    def _request_wake(self):
+        """Thread-safe wake trigger (called from the audio or GUI thread)."""
+        if self._loop and self.asleep:
+            self._loop.call_soon_threadsafe(self._schedule_wake)
+
+    def _schedule_wake(self):
+        if self.asleep and self.session:
+            asyncio.create_task(self._wake())
+
+    async def _wake(self):
+        if not self.asleep:
+            return
+        self.asleep = False
+        self._woke_at = time.time()
+        print("[JARVIS] 👏 Wake signal — booting up.")
+        self.ui.write_log("SYS: Wake signal detected.")
+        self.ui.set_state("WAKING")
+        # Let the boot-up animation play before greeting.
+        await asyncio.sleep(2.2)
+        if self.asleep:        # went back to sleep mid-boot
+            return
+        self.ui.set_state("LISTENING")
+        self._send_wake_greeting()
+
+    def _send_wake_greeting(self):
+        sample = (self._last_user_text or "").strip()
+        if sample:
+            lang_clause = (
+                f"The user has been speaking in this language: \"{sample}\". "
+                f"Greet them in THAT SAME language (do not translate to English). "
+            )
+        else:
+            lang_clause = "Greet them in English (no prior language is known yet). "
+        self.speak(
+            "SYSTEM: The user just activated you. " + lang_clause +
+            "Reply now with one brief, warm spoken greeting for the current "
+            "time of day and ask how you can help. Do not call any tools — just "
+            "speak the greeting."
+        )
+
+    def _enter_standby(self) -> str:
+        """Put JARVIS to sleep; it then waits for a clap or snap to wake."""
+        # Guard against a spurious standby right after waking (e.g. the model
+        # misfiring on the wake greeting). Ignore standby within 4s of waking.
+        if time.time() - self._woke_at < 4.0:
+            return "I just woke up, sir — standing by and ready to help."
+        self.asleep = True
+        self._clap.reset(cooldown=2.0)
+        self.ui.set_state("ASLEEP")
+        self.ui.write_log("SYS: Entering standby — clap or snap to wake.")
+        print("[JARVIS] 😴 Standby. Clap or snap to wake.")
+        return "Going into standby, sir. Clap or snap when you need me."
+
     def _build_config(self) -> types.LiveConnectConfig:
         from datetime import datetime
 
@@ -708,6 +1009,11 @@ class JarvisLive:
         if mem_str:
             parts.append(mem_str)
         parts.append(sys_prompt)
+        if self.persona and self.persona != "J.A.R.V.I.S":
+            parts.append(
+                f"\n[PERSONA]\nYou are currently operating as {self.persona}. "
+                f"Refer to yourself as {self.persona} when naming yourself.\n"
+            )
 
         return types.LiveConnectConfig(
             response_modalities=["AUDIO"],
@@ -719,7 +1025,7 @@ class JarvisLive:
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name="Charon"
+                        voice_name=self.voice_name
                     )
                 )
             ),
@@ -874,12 +1180,37 @@ class JarvisLive:
                 r = await loop.run_in_executor(None, lambda: face_auth(parameters=args, player=self.ui))
                 result = r or "Done."
 
+            elif name == "my_location":
+                r = await loop.run_in_executor(None, lambda: my_location(parameters=args, player=self.ui))
+                result = r or "Done."
+
+            elif name == "maps_search":
+                r = await loop.run_in_executor(None, lambda: maps_search(parameters=args, player=self.ui))
+                result = r or "Done."
+
+            elif name == "track_price":
+                r = await loop.run_in_executor(None, lambda: track_price(parameters=args, player=self.ui))
+                result = r or "Done."
+
+            elif name == "switch_voice":
+                result = self._switch_voice(args)
+
+            elif name == "set_voice_sample":
+                result = self.set_voice_sample(args)
+
+            elif name == "standby":
+                result = self._enter_standby()
+
             elif name == "shutdown_jarvis":
                 self.ui.write_log("SYS: Shutdown requested.")
                 self.speak("Goodbye, sir.")
                 def _shutdown():
                     import time, os
                     time.sleep(1)
+                    try:
+                        self.voice_engine.stop()
+                    except Exception:
+                        pass
                     os._exit(0)
                 threading.Thread(target=_shutdown, daemon=True).start()
 
@@ -905,6 +1236,12 @@ class JarvisLive:
             msg = await self.out_queue.get()
             await self.session.send_realtime_input(media=msg)
 
+    async def _watch_reconnect(self):
+        """Wait for a voice-switch request, then break the session so run()
+        reconnects with the newly-selected voice."""
+        await self._reconnect_event.wait()
+        raise _VoiceSwitch()
+
     async def _listen_audio(self):
         print("[JARVIS] 🎤 Mic started")
         loop = asyncio.get_event_loop()
@@ -912,6 +1249,19 @@ class JarvisLive:
         def callback(indata, frames, time_info, status):
             with self._speaking_lock:
                 jarvis_speaking = self._is_speaking
+
+            # While asleep, listen only for a clap to wake — don't stream to
+            # Gemini. Skip detection while JARVIS is speaking (its own audio
+            # could leak into the mic).
+            if self.asleep:
+                if not jarvis_speaking:
+                    try:
+                        if self._clap.feed(indata[:, 0]):
+                            loop.call_soon_threadsafe(self._schedule_wake)
+                    except Exception:
+                        pass
+                return
+
             if not jarvis_speaking and not self.ui.muted:
                 data = indata.tobytes()
                 loop.call_soon_threadsafe(
@@ -934,9 +1284,25 @@ class JarvisLive:
             print(f"[JARVIS] ❌ Mic: {e}")
             raise
 
+    async def _speak_cloned(self, text: str, native_buf: list):
+        """Speak this reply in the cloned (uploaded) voice when possible, else
+        play the buffered Gemini audio we held back as a fallback."""
+        pcm = None
+        if text:
+            self.ui.set_state("THINKING")
+            pcm = await asyncio.to_thread(self.voice_engine.synthesize, text)
+        if pcm:
+            self._enqueue_pcm(pcm)
+        else:
+            for chunk in native_buf:
+                self.audio_in_queue.put_nowait(chunk)
+
     async def _receive_audio(self):
         print("[JARVIS] 👂 Recv started")
         out_buf, in_buf = [], []
+        native_buf      = []      # raw Gemini audio, held back for fallback
+        clone_turn      = False   # latched per turn: clone this reply?
+        turn_started    = False
 
         try:
             while True:
@@ -945,7 +1311,15 @@ class JarvisLive:
                     if response.data:
                         if self._turn_done_event and self._turn_done_event.is_set():
                             self._turn_done_event.clear()
-                        self.audio_in_queue.put_nowait(response.data)
+                        if not turn_started:
+                            turn_started = True
+                            # Decide once per turn: clone only if the voice
+                            # worker is ready now; otherwise stream Gemini live.
+                            clone_turn = self.voice_engine.ready
+                        if clone_turn:
+                            native_buf.append(response.data)   # hold for fallback
+                        else:
+                            self.audio_in_queue.put_nowait(response.data)
 
                     if response.server_content:
                         sc = response.server_content
@@ -961,18 +1335,28 @@ class JarvisLive:
                                 in_buf.append(txt)
 
                         if sc.turn_complete:
-                            if self._turn_done_event:
-                                self._turn_done_event.set()
-
                             full_in = " ".join(in_buf).strip()
                             if full_in:
                                 self.ui.write_log(f"You: {full_in}")
+                                # Remember the language for the next wake greeting.
+                                self._last_user_text = full_in
+                                _save_lang_sample(full_in)
                             in_buf = []
 
                             full_out = " ".join(out_buf).strip()
                             if full_out:
-                                self.ui.write_log(f"Jarvis: {full_out}")
+                                self.ui.write_log(f"Sri: {full_out}")
                             out_buf = []
+
+                            # Cloned-voice playback (or fallback to Gemini audio).
+                            if clone_turn:
+                                await self._speak_cloned(full_out, native_buf)
+                            native_buf   = []
+                            turn_started = False
+                            clone_turn   = False
+
+                            if self._turn_done_event:
+                                self._turn_done_event.set()
 
                     if response.tool_call:
                         fn_responses = []
@@ -1046,17 +1430,36 @@ class JarvisLive:
                     self.audio_in_queue = asyncio.Queue()
                     self.out_queue      = asyncio.Queue(maxsize=10)
                     self._turn_done_event = asyncio.Event()
+                    self._reconnect_event = asyncio.Event()
 
-                    print("[JARVIS] ✅ Connected.")
-                    self.ui.set_state("LISTENING")
-                    self.ui.write_log("SYS: JARVIS online.")
+                    print(f"[JARVIS] ✅ Connected ({self.persona} / {self.voice_name}).")
+                    if self.asleep:
+                        self._clap.reset(cooldown=1.0)
+                        self.ui.set_state("ASLEEP")
+                        self.ui.write_log("SYS: JARVIS online — standby. Clap or snap to wake.")
+                    else:
+                        self.ui.set_state("LISTENING")
+                        self.ui.write_log("SYS: JARVIS online.")
 
                     tg.create_task(self._send_realtime())
                     tg.create_task(self._listen_audio())
                     tg.create_task(self._receive_audio())
                     tg.create_task(self._play_audio())
+                    tg.create_task(self._watch_reconnect())
+
+                    # After a voice switch, greet in the new voice so the user
+                    # immediately hears the change.
+                    if self._announce_voice and not self.asleep:
+                        self._announce_voice = False
+                        await asyncio.sleep(0.4)
+                        self.speak(f"This is {self.persona}. How do I sound now, sir?")
 
             except Exception as e:
+                if _is_voice_switch(e):
+                    self.set_speaking(False)
+                    self.ui.set_state("THINKING")
+                    print(f"[JARVIS] 🎚️  Switching voice → {self.voice_name}; reconnecting now...")
+                    continue
                 print(f"[JARVIS] ⚠️ {e}")
                 traceback.print_exc()
             self.set_speaking(False)

@@ -1,0 +1,11 @@
+# Cloned-voice engine (XTTS-v2) — install into a SEPARATE Python 3.10-3.12 venv
+# (.venv-tts), NOT the main app's venv. The main app runs on Python 3.13, which
+# coqui-tts does not support, so the model lives in its own process.
+#
+#   uv venv --python python3.11 .venv-tts
+#   uv pip install --python .venv-tts/bin/python -r requirements.tts.txt
+#
+# The XTTS-v2 model (~1.8GB) downloads automatically on first synthesis.
+coqui-tts[cpu]
+torchcodec>=0.8          # torchaudio >=2.9 needs torchcodec for audio IO
+transformers>=4.57,<5    # coqui-tts requires >=4.57; 5.x removed isin_mps_friendly

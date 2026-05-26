@@ -5,7 +5,7 @@ import urllib.parse
 import requests
 
 _API = "https://api.dictionaryapi.dev/api/v2/entries/en/"
-_HEADERS = {"User-Agent": "MarkXXXIX-JARVIS/1.0"}
+_HEADERS = {"User-Agent": "AgentSri/1.0"}
 
 
 def define_word(parameters: dict, response=None, player=None,
