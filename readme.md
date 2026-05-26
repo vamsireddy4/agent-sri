@@ -167,6 +167,18 @@ bash install_linux.sh                    # / install_mac.sh / install_windows.ba
 
 ---
 
+## 🙌 Credits
+
+Built and maintained by **[@vamsireddy4](https://github.com/vamsireddy4)** — including the
+cloned-voice engine (XTTS-v2), romanized multilingual (Tenglish / Hinglish / …) replies,
+signed-in browser control over CDP, the QPainter vector-icon UI, and the macOS / Windows /
+Linux installers.
+
+Foundation from the open-source [Mark-XXXIX](https://github.com/FatihMakes/Mark-XXXIX)
+project by FatihMakes.
+
+---
+
 ## ⚠️ License
 
 Personal and non-commercial use only — **[CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/)**, inherited from the upstream Mark-XXXIX project by [FatihMakes](https://www.youtube.com/@FatihMakes).
