@@ -19,9 +19,11 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QBrush, QColor, QDragEnterEvent, QDropEvent, QFont, QFontDatabase,
-    QKeySequence, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap,
+    QIcon, QKeySequence, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap,
     QRadialGradient, QShortcut,
 )
+
+import icons
 from PyQt6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QPushButton, QScrollArea, QSizePolicy, QTextEdit,
@@ -700,13 +702,14 @@ class LogWidget(QTextEdit):
             self.ensureCursorVisible()
             QTimer.singleShot(20, self._next)
 
+# (icon name for icons.paint_icon, accent colour)
 _FILE_ICONS = {
-    "image":   ("🖼", "#00d4ff"), "video":   ("🎬", "#ff6b00"),
-    "audio":   ("🎵", "#cc44ff"), "pdf":     ("📄", "#ff4444"),
-    "word":    ("📝", "#4488ff"), "excel":   ("📊", "#44bb44"),
-    "code":    ("💻", "#ffcc00"), "archive": ("📦", "#ff8844"),
-    "pptx":    ("📊", "#ff6622"), "text":    ("📃", "#aaaaaa"),
-    "data":    ("🔧", "#88ddff"), "unknown": ("📎", "#888888"),
+    "image":   ("image", "#00d4ff"), "video":   ("video",   "#ff6b00"),
+    "audio":   ("audio", "#cc44ff"), "pdf":     ("doc",     "#ff4444"),
+    "word":    ("doc",   "#4488ff"), "excel":   ("grid",    "#44bb44"),
+    "code":    ("code",  "#ffcc00"), "archive": ("archive", "#ff8844"),
+    "pptx":    ("slides","#ff6622"), "text":    ("doc",     "#aaaaaa"),
+    "data":    ("data",  "#88ddff"), "unknown": ("file",    "#888888"),
 }
 _EXT_TO_CAT = {
     **dict.fromkeys(["jpg","jpeg","png","gif","webp","bmp","tiff","svg","ico"], "image"),
@@ -872,14 +875,15 @@ class _DropCanvas(QWidget):
     def _paint_file(self, p, W, H):
         path = Path(self._z._current_file)
         cat  = _file_category(path)
-        icon, icon_col = _FILE_ICONS.get(cat, _FILE_ICONS["unknown"])
+        icon_name, icon_col = _FILE_ICONS.get(cat, _FILE_ICONS["unknown"])
         size_str = _fmt_size(path.stat().st_size)
         ext_str  = path.suffix.upper().lstrip(".") or "FILE"
 
         block_x, block_w = 10, 60
-        p.setFont(QFont("Segoe UI Emoji", 22) if _OS == "Windows" else QFont("Arial", 22))
-        p.setPen(QPen(qcol(icon_col), 1))
-        p.drawText(QRectF(block_x, 0, block_w, H), Qt.AlignmentFlag.AlignCenter, icon)
+        iw = 34
+        icons.paint_icon(p, icon_name,
+                         QRectF(block_x + (block_w - iw) / 2, (H - iw) / 2, iw, iw),
+                         icon_col, stroke=1.8)
 
         tx = block_x + block_w + 6
         tw = W - tx - 38
@@ -984,8 +988,12 @@ class SetupOverlay(QWidget):
 
         os_row = QHBoxLayout(); os_row.setSpacing(6)
         self._os_btns: dict[str, QPushButton] = {}
-        for key, label in [("windows","⊞  Windows"),("mac","  macOS"),("linux","🐧  Linux")]:
-            btn = QPushButton(label)
+        for key, ico, label in [("windows","windows","Windows"),
+                                ("mac","apple","macOS"),
+                                ("linux","linux","Linux")]:
+            btn = QPushButton("  " + label)
+            btn.setIcon(icons.make_icon(ico, C.PRI, 18))
+            btn.setIconSize(QSize(18, 18))
             btn.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
             btn.setFixedHeight(32)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1179,7 +1187,9 @@ class MainWindow(QMainWindow):
         self._mini_input.returnPressed.connect(self._send_mini)
         lay.addWidget(self._mini_input, stretch=1)
 
-        self._mini_mute = QPushButton("🎙")
+        self._mini_mute = QPushButton()
+        self._mini_mute.setIcon(icons.make_icon("mic", C.GREEN, 16))
+        self._mini_mute.setIconSize(QSize(16, 16))
         self._mini_mute.setFixedSize(30, 28)
         self._mini_mute.setCursor(Qt.CursorShape.PointingHandCursor)
         self._mini_mute.clicked.connect(self._toggle_mute)
@@ -1199,7 +1209,7 @@ class MainWindow(QMainWindow):
         return lw
 
     def _boot_sequence(self):
-        lines = ["⚡ POWERING ON…", "◈ NEURAL CORE ONLINE",
+        lines = ["◈ POWERING ON…", "◈ NEURAL CORE ONLINE",
                  "◈ SENSORS NOMINAL", "◈ SYSTEMS READY"]
         for i, ln in enumerate(lines):
             QTimer.singleShot(i * 480, lambda t=ln: self._log_line(f"SYS: {t}"))
@@ -1431,7 +1441,8 @@ class MainWindow(QMainWindow):
         lay.addWidget(_sec("COMMAND INPUT"))
         lay.addLayout(self._build_input_row())
 
-        self._mute_btn = QPushButton("🎙  MICROPHONE ACTIVE")
+        self._mute_btn = QPushButton("  MICROPHONE ACTIVE")
+        self._mute_btn.setIconSize(QSize(15, 15))
         self._mute_btn.setFixedHeight(30)
         self._mute_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
         self._mute_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1439,7 +1450,9 @@ class MainWindow(QMainWindow):
         self._style_mute_btn()
         lay.addWidget(self._mute_btn)
 
-        fs_btn = QPushButton("⛶  FULLSCREEN  [F11]")
+        fs_btn = QPushButton("  FULLSCREEN  [F11]")
+        fs_btn.setIcon(icons.make_icon("fullscreen", C.TEXT_MED, 14))
+        fs_btn.setIconSize(QSize(14, 14))
         fs_btn.setFixedHeight(26)
         fs_btn.setFont(QFont("Courier New", 7))
         fs_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1510,9 +1523,8 @@ class MainWindow(QMainWindow):
         self._current_file = path
         p    = Path(path)
         cat  = _file_category(p)
-        icon, _ = _FILE_ICONS.get(cat, _FILE_ICONS["unknown"])
         size = _fmt_size(p.stat().st_size)
-        self._file_hint.setText(f"{icon}  {p.name}  ·  {size}  ·  Tell Sri what to do with it")
+        self._file_hint.setText(f"{p.name}  ·  {size}  ·  Tell Sri what to do with it")
         self._log.append_log(f"FILE: {p.name} ({size}) loaded")
         if self.on_text_command:
             extra = ""
@@ -1544,7 +1556,8 @@ class MainWindow(QMainWindow):
 
     def _style_mute_btn(self):
         if self._muted:
-            self._mute_btn.setText("🔇  MICROPHONE MUTED")
+            self._mute_btn.setText("  MICROPHONE MUTED")
+            self._mute_btn.setIcon(icons.make_icon("mic_off", C.MUTED_C, 15))
             self._mute_btn.setStyleSheet(f"""
                 QPushButton {{
                     background: #140006; color: {C.MUTED_C};
@@ -1552,7 +1565,8 @@ class MainWindow(QMainWindow):
                 }}
             """)
         else:
-            self._mute_btn.setText("🎙  MICROPHONE ACTIVE")
+            self._mute_btn.setText("  MICROPHONE ACTIVE")
+            self._mute_btn.setIcon(icons.make_icon("mic", C.GREEN, 15))
             self._mute_btn.setStyleSheet(f"""
                 QPushButton {{
                     background: #00140a; color: {C.GREEN};
@@ -1562,7 +1576,7 @@ class MainWindow(QMainWindow):
             """)
         if hasattr(self, "_mini_mute"):
             mc = C.MUTED_C if self._muted else C.GREEN
-            self._mini_mute.setText("🔇" if self._muted else "🎙")
+            self._mini_mute.setIcon(icons.make_icon("mic_off" if self._muted else "mic", mc, 16))
             self._mini_mute.setStyleSheet(
                 f"QPushButton {{ background: transparent; color: {mc}; "
                 f"border: 1px solid {mc}; border-radius: 4px; }}"
