@@ -4,9 +4,24 @@
 set -e
 cd "$(dirname "$0")"
 
-PY="${PYTHON:-python3}"
+# The main app needs Python 3.11+ (uses asyncio.TaskGroup / ExceptionGroup).
+# Honour $PYTHON if set, otherwise pick the newest available 3.11+ interpreter.
+PY="${PYTHON:-}"
+if [ -z "$PY" ]; then
+  for c in python3.13 python3.12 python3.11 python3; do
+    if command -v "$c" >/dev/null 2>&1 && \
+       "$c" -c 'import sys; sys.exit(0 if sys.version_info[:2] >= (3,11) else 1)' 2>/dev/null; then
+      PY="$c"; break
+    fi
+  done
+fi
+if [ -z "$PY" ]; then
+  echo "ERROR: Agent Sri needs Python 3.11 or newer (asyncio.TaskGroup)."
+  echo "       Install e.g. 'sudo apt install python3.12 python3.12-venv' and re-run."
+  exit 1
+fi
 
-echo "==> Python version:"
+echo "==> Using Python: $PY"
 "$PY" --version
 
 # ── System packages ─────────────────────────────────────────────────────────
